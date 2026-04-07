@@ -43,24 +43,4 @@ Output naming pattern by default: `<ims_stem>_t###.tiff` (all channels retained 
 If `--split-channels` is used: `<ims_stem>_t###_c###.tiff`.
 
 
-### Troubleshooting
 
-If you see an error like:
-
-```
-SyntaxError: invalid decimal literal
-... index 0000000000000000000000000000000000000000..09977e...
-```
-
-that means Python is trying to run a **git diff** text block, not the script.
-Run the converter script file itself instead:
-
-```bash
-python convert_ims_to_tiff.py /path/to/ims_folder
-```
-
-In Jupyter, use:
-
-```python
-!python convert_ims_to_tiff.py /path/to/ims_folder
-```
