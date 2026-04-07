@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Convert Imaris .ims files to .tiff files for all files in a folder.
+
+This script reads image volumes from Imaris HDF5 containers and writes TIFF stacks.
+By default it exports ResolutionLevel 0, all timepoints, and all channels.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+# Simple option: set your folder path here and run the script.
+DEFAULT_INPUT_FOLDER = Path("/path/to/ims_folder")
+
+
+def find_ims_files(input_folder: Path, recursive: bool) -> list[Path]:
+    pattern = "**/*.ims" if recursive else "*.ims"
+    return sorted(p for p in input_folder.glob(pattern) if p.is_file())
+
+
+def _extract_index(name: str, prefix: str) -> int:
+    if not name.startswith(prefix):
+        raise ValueError(f"Unexpected group name '{name}', expected prefix '{prefix}'")
+    return int(name[len(prefix) :])
+
+
+def convert_file(
+    ims_path: Path,
+    output_folder: Path,
+    compression: str | None = "deflate",
+    split_channels: bool = False,
+) -> list[Path]:
+    import h5py
+    import numpy as np
+    import tifffile
+
+    exported: list[Path] = []
+
+    with h5py.File(ims_path, "r") as f:
+        dataset_root = f.get("DataSet")
+        if dataset_root is None:
+            raise ValueError(f"{ims_path} does not contain '/DataSet'")
+
+        level_key = "ResolutionLevel 0"
+        if level_key not in dataset_root:
+            available = ", ".join(dataset_root.keys())
+            raise ValueError(f"{ims_path} missing '{level_key}'. Available levels: {available}")
+
+        level_group = dataset_root[level_key]
+        timepoint_keys = sorted(level_group.keys(), key=lambda k: _extract_index(k, "TimePoint "))
+
+        for tp_key in timepoint_keys:
+            tp_group = level_group[tp_key]
+            channel_keys = sorted(tp_group.keys(), key=lambda k: _extract_index(k, "Channel "))
+            t_idx = _extract_index(tp_key, "TimePoint ")
+
+            if split_channels:
+                for ch_key in channel_keys:
+                    ch_group = tp_group[ch_key]
+                    if "Data" not in ch_group:
+                        continue
+
+                    data = np.asarray(ch_group["Data"])
+                    c_idx = _extract_index(ch_key, "Channel ")
+
+                    out_name = f"{ims_path.stem}_t{t_idx:03d}_c{c_idx:03d}.tiff"
+                    out_path = output_folder / out_name
+
+                    tifffile.imwrite(
+                        out_path,
+                        data,
+                        compression=compression,
+                    )
+                    exported.append(out_path)
+            else:
+                channel_arrays: list[np.ndarray] = []
+                for ch_key in channel_keys:
+                    ch_group = tp_group[ch_key]
+                    if "Data" not in ch_group:
+                        continue
+                    channel_arrays.append(np.asarray(ch_group["Data"]))
+
+                if not channel_arrays:
+                    continue
+
+                first_shape = channel_arrays[0].shape
+                if not all(arr.shape == first_shape for arr in channel_arrays):
+                    raise ValueError(
+                        f"Channel shapes differ in {ims_path.name} at timepoint {t_idx}: "
+                        f"{[arr.shape for arr in channel_arrays]}"
+                    )
+
+                combined = np.stack(channel_arrays, axis=0)  # C, Z, Y, X (or C + original dims)
+                out_name = f"{ims_path.stem}_t{t_idx:03d}.tiff"
+                out_path = output_folder / out_name
+
+                tifffile.imwrite(
+                    out_path,
+                    combined,
+                    compression=compression,
+                    metadata=None,
+                )
+                exported.append(out_path)
+
+    return exported
+
+
+def _clean_notebook_argv(argv: list[str]) -> list[str]:
+    """Remove notebook-kernel injected CLI args (e.g., `-f kernel-*.json`)."""
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+
+        if token == "-f":
+            i += 2
+            continue
+
+        if token.startswith("--f="):
+            i += 1
+            continue
+
+        cleaned.append(token)
+        i += 1
+
+    return cleaned
+
+
+def _looks_like_jupyter_kernel_file(path: Path | None) -> bool:
+    if path is None:
+        return False
+    name = path.name.lower()
+    parent = str(path.parent).lower()
+    return name.startswith("kernel-") and name.endswith(".json") and "runtime" in parent
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Convert all .ims files in a folder to .tiff")
+    parser.add_argument(
+        "input_folder",
+        nargs="?",
+        type=Path,
+        default=None,
+        help="Folder containing .ims files (defaults to DEFAULT_INPUT_FOLDER)",
+    )
+    parser.add_argument(
+        "--input-folder",
+        dest="input_folder_flag",
+        type=Path,
+        default=None,
+        help="Folder containing .ims files",
+    )
+    parser.add_argument(
+        "--output-folder",
+        type=Path,
+        default=None,
+        help="Folder for generated .tiff files (default: input folder)",
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Search for .ims files recursively",
+    )
+    parser.add_argument(
+        "--compression",
+        type=str,
+        default="deflate",
+        help="TIFF compression (e.g., deflate, lzma, zstd, none)",
+    )
+    parser.add_argument(
+        "--split-channels",
+        action="store_true",
+        help="Write one TIFF per channel (default keeps all channels in one TIFF per timepoint)",
+    )
+    argv = _clean_notebook_argv(sys.argv[1:])
+    args, _unknown = parser.parse_known_args(argv)
+
+    input_folder = args.input_folder_flag if args.input_folder_flag is not None else args.input_folder
+
+    if _looks_like_jupyter_kernel_file(input_folder):
+        input_folder = None
+
+    args.input_folder = input_folder
+    return args
+
+
+def resolve_input_folder(args: argparse.Namespace) -> Path:
+    """Resolve input folder from CLI or DEFAULT_INPUT_FOLDER."""
+    if args.input_folder is not None:
+        return args.input_folder
+    return DEFAULT_INPUT_FOLDER
+
+
+def main() -> None:
+    args = parse_args()
+
+    input_folder = resolve_input_folder(args)
+
+    if not input_folder.exists() or not input_folder.is_dir():
+        raise FileNotFoundError(f"Input folder does not exist or is not a directory: {input_folder}")
+
+    output_folder = args.output_folder or input_folder
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    ims_files = find_ims_files(input_folder, recursive=args.recursive)
+    if not ims_files:
+        raise FileNotFoundError(f"No .ims files found in: {input_folder}")
+
+    compression = None if str(args.compression).lower() == "none" else args.compression
+
+    total_outputs = 0
+    for ims_path in ims_files:
+        outputs = convert_file(
+            ims_path,
+            output_folder=output_folder,
+            compression=compression,
+            split_channels=args.split_channels,
+        )
+        total_outputs += len(outputs)
+        print(f"Converted {ims_path.name}: {len(outputs)} TIFF file(s)")
+
+    print(f"Done. Created {total_outputs} TIFF file(s) in {output_folder}")
+
+
+if __name__ == "__main__":
+    main()
